@@ -8,13 +8,23 @@
 
 ---
 
-## 📥 下载（小白看这里）
+## 📥 下载
 
-> **[ 多线程极速下载脚本_v3.zip ](https://github.com/17612587/fast-download-cli/releases/latest)**
+### 方式一：直接下载 ZIP（推荐，适合小白）
 
-**下载解压 → 双击 `go_download.bat` → 粘贴链接 → 回车开始下载，就这么简单！**
+**点击页面右上角绿色 ` Code` 按钮 → `Download ZIP`**
 
-包含所有文件（脚本 + aria2c 引擎 + 使用说明），解压即用，无需任何配置。
+解压后双击 `go_download.bat` 即可启动。aria2c 引擎用到的时侯会自动提示安装。
+
+### 方式二：下载完整包（含 aria2c 引擎）
+
+> [**多线程极速下载脚本_v3.zip**](https://github.com/17612587/fast-download-cli/releases/latest)
+
+已内置 aria2c 引擎，下载更大但完全离线可用。
+
+---
+
+**两种方式都是：解压 → 双击 `go_download.bat` → 粘贴链接 → 回车开始下载**
 
 ---
 
