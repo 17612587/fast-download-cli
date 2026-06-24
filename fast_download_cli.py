@@ -12,6 +12,9 @@ import time
 import ctypes
 import base64
 import shutil
+import socket
+import struct
+import random
 import subprocess
 import threading
 import requests
@@ -28,6 +31,30 @@ CHUNK_SIZE = 1024 * 1024
 CONNECT_TIMEOUT = 30
 READ_TIMEOUT = 300
 MAX_RETRIES = 10
+
+# DNS 服务器列表
+DNS_SERVERS = {
+    "ali":      ("223.5.5.5",        "阿里 DNS"),
+    "dnspod":   ("119.29.29.29",     "DNSPod"),
+    "baidu":    ("180.76.76.76",     "百度 DNS"),
+    "cn_114":   ("114.114.114.114",  "114 DNS"),
+    "google":   ("8.8.8.8",          "Google DNS"),
+    "cf":       ("1.1.1.1",          "Cloudflare"),
+}
+
+# 中国网站域名特征（自动使用国内 DNS）
+CN_TLDS = {".cn", ".com.cn", ".net.cn", ".org.cn", ".gov.cn", ".edu.cn"}
+CN_DOMAINS = {  # 知名国内站点及中文命名的域名
+    "msdngho.com", "yunzhongzhuan.com", "lanzou.com", "lanzoux.com",
+    "baidu.com", "aliyun.com", "alibaba.com", "jd.com", "taobao.com",
+    "bilibili.com", "zhihu.com", "csdn.net", "oschina.net",
+    "123pan.com", "quark.cn", "gitee.com", "coding.net",
+    "woozooo.com", "蓝奏.com", "pan.baidu.com",
+}
+
+DEFAULT_CN_DNS = "ali"   # 国内默认 DNS
+DEFAULT_GLOBAL_DNS = "cf"  # 国际默认 DNS
+DNS_TIMEOUT = 5  # DNS 查询超时（秒）
 ARIA2C_URL = "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip"
 
 # ── 全局状态 ──────────────────────────────────────────
@@ -39,6 +66,8 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 global_referer = ""  # 全局 Referer，用于防盗链 CDN
 global_cookies = {}  # 全局 Cookie，用于重定向链认证
 global_download_url = ""  # 解析重定向后的最终 URL
+global_dns_orig_host = ""  # 智能 DNS 解析时的原始域名（用于 Host 头）
+global_dns_used = False  # 是否启用了自定义 DNS
 
 
 # ═══════════════════════════════════════════════════════
@@ -428,14 +457,218 @@ def download_http_via_aria2(url: str, dest: str, num_connections: int = 16):
 
 
 # ═══════════════════════════════════════════════════════
-# HTTP 下载核心
+# 智能 DNS 解析 — 绕过 VPN/代理导致的 DNS 污染
 # ═══════════════════════════════════════════════════════
+
+def _encode_dns_name(hostname: str) -> bytes:
+    """将域名编码为 DNS 查询格式：长度前缀 + 字节"""
+    result = bytearray()
+    for label in hostname.encode("idna").split(b"."):
+        result.append(len(label))
+        result.extend(label)
+    result.append(0)
+    return bytes(result)
+
+
+def _decode_dns_name(data: bytes, offset: int) -> tuple:
+    """从 DNS 响应中解码域名，返回 (域名, 新偏移)"""
+    labels = []
+    jumped = False
+    orig_offset = offset
+    max_hops = 20
+
+    for _ in range(max_hops):
+        length = data[offset]
+        if length == 0:
+            offset += 1
+            break
+        if length & 0xC0:  # 指针
+            ptr = ((length & 0x3F) << 8) | data[offset + 1]
+            offset += 2
+            if not jumped:
+                orig_offset = offset
+                jumped = True
+            sub_labels, _ = _decode_dns_name(data, ptr)
+            labels.extend(sub_labels)
+            break
+        else:
+            offset += 1
+            labels.append(data[offset:offset + length].decode("ascii", errors="replace"))
+            offset += length
+
+    return labels, (orig_offset if jumped else offset)
+
+
+def _is_ipv4(s: str) -> bool:
+    """判断字符串是否为合法 IPv4 地址"""
+    parts = s.split(".")
+    if len(parts) != 4:
+        return False
+    try:
+        return all(0 <= int(p) <= 255 for p in parts)
+    except (ValueError, TypeError):
+        return False
+
+
+def dns_resolve(hostname: str, dns_server: str = "223.5.5.5", timeout: int = DNS_TIMEOUT) -> list:
+    """使用指定 DNS 服务器解析域名，返回 IP 列表"""
+    txid = random.randint(0, 0xFFFF)
+
+    # 构造 DNS 查询包
+    header = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0)
+    question = _encode_dns_name(hostname) + struct.pack("!HH", 1, 1)  # A 记录, IN 类
+    packet = header + question
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(packet, (dns_server, 53))
+        response, _ = sock.recvfrom(1024)
+    finally:
+        sock.close()
+
+    # 解析响应
+    resp_id, flags, qdcount, ancount, nscount, arcount = struct.unpack("!HHHHHH", response[:12])
+    if resp_id != txid:
+        return []
+    if ancount == 0:
+        return []
+
+    # 跳过问题段
+    offset = 12
+    for _ in range(qdcount):
+        _, offset = _decode_dns_name(response, offset)
+        offset += 4  # QTYPE + QCLASS
+
+    # 解析答案段
+    ips = []
+    for _ in range(ancount):
+        _, offset = _decode_dns_name(response, offset)
+        rtype, rclass, ttl, rdlength = struct.unpack("!HHIH", response[offset:offset + 10])
+        offset += 10
+        if rtype == 1 and rclass == 1 and rdlength == 4:  # A 记录
+            ip = ".".join(str(b) for b in response[offset:offset + 4])
+            ips.append(ip)
+        offset += rdlength
+
+    return ips
+
+
+def is_chinese_site(hostname: str) -> bool:
+    """检测是否为中国网站（自动匹配国内 DNS）"""
+    host_lower = hostname.lower()
+    # TLD 检测
+    for tld in CN_TLDS:
+        if host_lower.endswith(tld):
+            return True
+    # 域名特征匹配
+    for cn_domain in CN_DOMAINS:
+        if host_lower == cn_domain or host_lower.endswith("." + cn_domain):
+            return True
+    return False
+
+
+def resolve_hostname_smart(hostname: str, preferred_dns: str = None) -> str:
+    """
+    智能解析域名：
+    1. 先用系统 DNS 尝试
+    2. 如果是中国网站或系统 DNS 失败 → 国内 DNS
+    3. 如果仍然失败 → 依次尝试所有 DNS
+    返回 IP 或原 hostname（全部失败时）
+    """
+    # 已经是 IP 则直接返回
+    try:
+        parts = hostname.split(".")
+        if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
+            return hostname
+    except Exception:
+        pass
+
+    is_cn = is_chinese_site(hostname)
+
+    # 1. 系统 DNS
+    for attempt in range(3):
+        try:
+            ai = socket.getaddrinfo(hostname, 80, socket.AF_INET, socket.SOCK_STREAM)
+            ip = ai[0][4][0]
+            if ip:
+                return hostname  # 系统 DNS 成功，保留域名（Cookie/SSL 兼容性）
+        except socket.gaierror:
+            time.sleep(0.5)
+
+    # 2. 系统 DNS 失败 → 智能选择
+    dns_keys = []
+    if preferred_dns:
+        dns_keys.append(preferred_dns)
+    if is_cn:
+        dns_keys.extend(["ali", "dnspod", "cn_114", "baidu"])
+    else:
+        dns_keys.extend(["cf", "google", "ali", "dnspod"])
+
+    for key in dns_keys:
+        if key not in DNS_SERVERS:
+            continue
+        server, name = DNS_SERVERS[key]
+        ips = dns_resolve(hostname, server)
+        if ips:
+            return ips[0]  # 返回 IP
+
+    return hostname  # 全部失败，保持原样让 requests 自己处理
+
+
+def url_with_host_resolved(url: str, use_smart_dns: bool = True) -> tuple:
+    """
+    尝试用智能 DNS 解析 URL 中的主机名。
+    返回: (解析后的 URL, 原始 hostname, 是否用了自定义 DNS)
+    """
+    if not use_smart_dns:
+        return url, "", False
+
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if not hostname:
+        return url, "", False
+
+    resolved = resolve_hostname_smart(hostname)
+    if resolved == hostname:
+        return url, hostname, False  # 系统 DNS 正常
+
+    # 替换 hostname 为 IP
+    netloc = parsed.netloc.replace(hostname, resolved, 1)
+    if parsed.port:
+        netloc = netloc.replace(f":{parsed.port}", f":{parsed.port}", 1)  # 保持端口
+    new_url = parsed._replace(netloc=netloc).geturl()
+    return new_url, hostname, True
 
 def resolve_url_with_referer(url: str) -> tuple:
     """
     手动跟随重定向，记录各跳转 Host 用作 Referer + 保存 Cookie
     返回: (最终URL, referer_chain, final_headers, cookies)
     """
+    global global_dns_orig_host, global_dns_used
+
+    # ── 智能 DNS：先解析域名 ──
+    parsed_init = urlparse(url)
+    orig_host = parsed_init.hostname or ""
+    global_dns_orig_host = ""
+    global_dns_used = False
+
+    if orig_host and parsed_init.scheme in ("http", "https"):
+        resolved = resolve_hostname_smart(orig_host)
+        if resolved != orig_host:
+            # 自定义 DNS 成功 → 用 IP 替换，保留 Host 头
+            netloc = resolved
+            if parsed_init.port:
+                netloc = f"{resolved}:{parsed_init.port}"
+            current_url = parsed_init._replace(netloc=netloc).geturl()
+            global_dns_orig_host = orig_host
+            global_dns_used = True
+            print(f"\n  [*] 智能 DNS: {orig_host} -> {resolved} (系统 DNS 不通)")
+        else:
+            current_url = url
+    else:
+        current_url = url
+
     session = requests.Session()
     referer = ""
     headers = {
@@ -443,7 +676,8 @@ def resolve_url_with_referer(url: str) -> tuple:
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/120.0.0.0 Safari/537.36",
     }
-    current_url = url
+    if global_dns_used:
+        headers["Host"] = global_dns_orig_host
     visited = set()
     max_hops = 10
 
@@ -454,6 +688,11 @@ def resolve_url_with_referer(url: str) -> tuple:
         req_headers = dict(headers)
         if referer:
             req_headers["Referer"] = referer
+
+        # 如果当前 URL 的 host 是 IP（由 DNS 解析而来），保持 Host 头
+        current_hostname = parsed.hostname or ""
+        if global_dns_used and _is_ipv4(current_hostname):
+            req_headers["Host"] = global_dns_orig_host
 
         resp = session.head(current_url, allow_redirects=False,
                             timeout=30, headers=req_headers)
@@ -485,7 +724,7 @@ def resolve_url_with_referer(url: str) -> tuple:
 
 def get_file_info(url: str) -> tuple:
     """获取文件大小、Range 支持（使用已有的 global_referer / global_cookies）"""
-    global global_referer, global_cookies
+    global global_referer, global_cookies, global_dns_used, global_dns_orig_host
     print("\n  [*] 正在获取文件信息...", end="", flush=True)
 
     req_headers = {
@@ -495,6 +734,8 @@ def get_file_info(url: str) -> tuple:
     }
     if global_referer:
         req_headers["Referer"] = global_referer
+    if global_dns_used and global_dns_orig_host:
+        req_headers["Host"] = global_dns_orig_host
 
     def _is_error(resp_obj, clen, ctype):
         """检测响应是否为错误页面"""
@@ -566,7 +807,7 @@ def get_file_info(url: str) -> tuple:
 
 def download_chunk(idx: int, url: str, start: int, end: int, part_file: str):
     """下载一个分块，支持断点续传"""
-    global total_downloaded, global_referer, global_cookies
+    global total_downloaded, global_referer, global_cookies, global_dns_used, global_dns_orig_host
     current = start
     retries = 0
 
@@ -577,6 +818,8 @@ def download_chunk(idx: int, url: str, start: int, end: int, part_file: str):
     }
     if global_referer:
         base_headers["Referer"] = global_referer
+    if global_dns_used and global_dns_orig_host:
+        base_headers["Host"] = global_dns_orig_host
 
     while retries < MAX_RETRIES:
         try:
@@ -611,6 +854,7 @@ def download_chunk(idx: int, url: str, start: int, end: int, part_file: str):
 def single_thread_download(url: str, dest: str, total_size: int):
     """单线程下载"""
     global total_downloaded, start_time, done_flag, global_referer, global_cookies
+    global global_dns_used, global_dns_orig_host
     start_time = time.time()
     downloaded = 0
 
@@ -621,6 +865,8 @@ def single_thread_download(url: str, dest: str, total_size: int):
     }
     if global_referer:
         req_headers["Referer"] = global_referer
+    if global_dns_used and global_dns_orig_host:
+        req_headers["Host"] = global_dns_orig_host
 
     resp = requests.get(url, stream=True,
                         timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
@@ -760,12 +1006,15 @@ def run_http_download(url: str, dest: str, num_threads: int):
     """HTTP(S) 下载入口"""
     global total_downloaded, start_time, done_flag
     global global_referer, global_cookies, global_download_url
+    global global_dns_used, global_dns_orig_host
     total_downloaded = 0
     start_time = time.time()
     done_flag = False
     global_referer = ""
     global_cookies = {}
     global_download_url = ""
+    global_dns_used = False
+    global_dns_orig_host = ""
 
     # 1. 手动跟随重定向，获取最终 CDN URL、Referer、Cookie
     final_url, referer, _, cookies = resolve_url_with_referer(url)
@@ -846,7 +1095,7 @@ def _download_via_redirect_stream(url: str, dest: str):
     通过短链接自然重定向下载 — 不手动解析 URL，让 HTTP 客户端跟随重定向
     这是最接近 curl -L / 浏览器 / 群晖行为的模式
     """
-    global total_downloaded, start_time, done_flag
+    global total_downloaded, start_time, done_flag, global_dns_used, global_dns_orig_host
 
     print(f"  [*] 通过短链接流式下载: {url[:80]}...")
     total_downloaded = 0
@@ -855,14 +1104,20 @@ def _download_via_redirect_stream(url: str, dest: str):
 
     try:
         session = requests.Session()
+        req_hdrs = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; "
+                          "Win64; x64) AppleWebKit/537.36 "
+                          "(KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36",
+        }
+        if global_dns_used and global_dns_orig_host:
+            req_hdrs["Host"] = global_dns_orig_host
+        if global_referer:
+            req_hdrs["Referer"] = global_referer
         resp = session.get(url, stream=True, allow_redirects=True,
                            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-                           headers={
-                               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; "
-                                             "Win64; x64) AppleWebKit/537.36 "
-                                             "(KHTML, like Gecko) "
-                                             "Chrome/120.0.0.0 Safari/537.36",
-                           })
+                           headers=req_hdrs,
+                           cookies=global_cookies)
 
         if resp.status_code >= 400:
             ct = resp.headers.get("Content-Type", "")
@@ -1095,17 +1350,17 @@ def main():
     print("\n  [*] 正在解析文件名...", end="", flush=True)
     try:
         final_url, referer, _, _cookies = resolve_url_with_referer(url)
+        head_headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36",
+        }
+        if referer:
+            head_headers["Referer"] = referer
+        if global_dns_used and global_dns_orig_host:
+            head_headers["Host"] = global_dns_orig_host
         resp = requests.head(final_url, allow_redirects=False, timeout=30,
-                             headers={
-                                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                               "Chrome/120.0.0.0 Safari/537.36",
-                                 "Referer": referer,
-                             } if referer else {
-                                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                                               "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                               "Chrome/120.0.0.0 Safari/537.36",
-                             })
+                             headers=head_headers)
     except Exception:
         resp = None
         final_url, referer = url, ""
@@ -1121,6 +1376,8 @@ def main():
                               "Chrome/120.0.0.0 Safari/537.36",
                 "Range": "bytes=0-0",
             }
+            if global_dns_used and global_dns_orig_host:
+                probe_headers["Host"] = global_dns_orig_host
             probed = requests.get(final_url or url, headers=probe_headers,
                                   timeout=30, stream=True)
             new_name, _ = resolve_filename(final_url or url, probed)
