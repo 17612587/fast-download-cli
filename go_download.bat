@@ -1,23 +1,27 @@
 @echo off
-chcp 65001 >nul
-title Fast Download CLI
+cd /d "%~dp0"
+echo.
+echo ============================================================
+echo   Fast Download CLI v3
+echo   HTTP/HTTPS/Thunder/Magnet/BT
+echo ============================================================
+echo.
+echo Checking Python...
+python --version 2>nul
+if errorlevel 1 goto :no_python
+echo.
+echo Starting...
+echo.
 
-:: Auto-detect Python (try python3 first, then python)
-set PYTHON=
-for %%p in (python3 python) do (
-    where %%p >nul 2>&1
-    if not errorlevel 1 (
-        set PYTHON=%%p
-        goto :found
-    )
-)
+python "%~dp0fast_download_cli.py"
+pause
+exit /b 0
 
-echo [ERROR] Python not found in PATH. Please install Python 3.8+.
+:no_python
+echo.
+echo [ERROR] Python not found!
+echo Please install Python 3.8+: https://www.python.org/downloads/
+echo Make sure to check "Add Python to PATH" during installation.
+echo.
 pause
 exit /b 1
-
-:found
-echo [OK] Using %PYTHON%
-echo.
-"%PYTHON%" "%~dp0fast_download_cli.py"
-pause
