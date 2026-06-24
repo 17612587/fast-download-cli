@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+
+# aria2c binary (too large)
+aria2c.exe
+
+# Downloaded files
+*.part*
+*.torrent
+*.esd
+*.iso
+*.zip
+*.rar
+*.7z
+download.bin
+
+# OS
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
