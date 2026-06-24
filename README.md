@@ -2,8 +2,19 @@
 
 [![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey.svg)]()
+[![Release](https://img.shields.io/badge/Release-v3.0-green.svg)](https://github.com/17612587/fast-download-cli/releases/latest)
 
   Windows   Linux   macOS 通用多线程下载工具，**交互式命令行操作**，支持 HTTP/HTTPS 直链、迅雷链接、磁力链接、BT 种子文件。
+
+---
+
+## 📥 下载（小白看这里）
+
+> **[ 多线程极速下载脚本_v3.zip ](https://github.com/17612587/fast-download-cli/releases/latest)**
+
+**下载解压 → 双击 `go_download.bat` → 粘贴链接 → 回车开始下载，就这么简单！**
+
+包含所有文件（脚本 + aria2c 引擎 + 使用说明），解压即用，无需任何配置。
 
 ---
 
