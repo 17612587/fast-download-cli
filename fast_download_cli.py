@@ -18,6 +18,7 @@ import random
 import subprocess
 import threading
 import requests
+import signal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, unquote
 
@@ -69,6 +70,35 @@ global_download_url = ""  # 解析重定向后的最终 URL
 global_dns_orig_host = ""  # 智能 DNS 解析时的原始域名（用于 Host 头）
 global_dns_used = False  # 是否启用了自定义 DNS
 
+# ── 碎片文件追踪（用于 Ctrl+C 中断清理）──────
+_part_files = []
+_dest_file = ""
+
+def _register_part_file(path: str):
+    """注册需要清理的碎片文件"""
+    _part_files.append(path)
+
+def _cleanup_all_parts():
+    """清理所有多线程碎片文件"""
+    global _part_files
+    for f in _part_files:
+        try:
+            if os.path.exists(f):
+                os.remove(f)
+        except Exception:
+            pass
+    _part_files = []
+
+def _interrupt_handler(sig, frame):
+    """Ctrl+C 中断处理器 — 清理碎片后退出"""
+    print("\n\n  [!] 用户中断下载")
+    if _part_files:
+        print(f"  [*] 正在清理 {len(_part_files)} 个碎片文件...")
+        _cleanup_all_parts()
+        print("  [*] 清理完成")
+    print("  [*] 已退出\n")
+    os._exit(0)
+
 
 # ═══════════════════════════════════════════════════════
 # 工具函数
@@ -95,24 +125,6 @@ def format_time(seconds: float) -> str:
         h, r = divmod(seconds, 3600)
         m = r // 60
         return f"{h:.0f}h{m:.0f}m"
-
-
-def is_cdn_presigned_url(url: str) -> bool:
-    """检测是否为 CDN 签名链接（通常限制并发连接，多线程无效）"""
-    lower = url.lower()
-    indicators = [
-        "x-amz-signature",          # AWS S3 presigned
-        "x-amz-algorithm",
-        "x-amz-credential",
-        "sign=", "&sign=",          # 通用签名参数
-        "?sign=",
-        "token=", "&token=",        # 临时令牌
-        "?token=",
-        "cmecloud.cn",              # 已知限制并发的 CDN
-        "aliyuncs.com",             # 阿里云 OSS
-        "signature=",               # 通用签名
-    ]
-    return any(indicator in lower for indicator in indicators)
 
 
 # ═══════════════════════════════════════════════════════
@@ -1028,37 +1040,23 @@ def run_http_download(url: str, dest: str, num_threads: int):
     # 2. 获取文件信息
     total_size, supports_range, resp = get_file_info(final_url)
 
-    # 检测 CDN 签名链接
-    cdn_presigned = is_cdn_presigned_url(final_url)
-    from_short_link = final_url != url
-
     if total_size == 0:
-        # 直接 CDN 探测失败 → 尝试用原始短链接 + 自然重定向下载
+        # 直接探测失败 → 尝试用原始短链接 + 自然重定向下载
         if final_url != url:
-            print("\n  [*] 直接 CDN 请求失败，尝试通过短链接自然重定向下载...")
+            print("\n  [*] 直接请求失败，尝试通过短链接自然重定向下载...")
             _download_via_redirect_stream(url, dest)
         else:
             print("  [*] 文件信息获取失败，尝试直接流式下载...")
             _do_single_download(final_url, dest, 0)
         return
 
-    # ── 下载器选择 ──────────────────────────
+    # ── 是否使用 aria2c？(仅询问，不自动切换) ──────
     use_aria2 = False
     aria2 = find_aria2c()
 
-    if cdn_presigned and from_short_link:
-        # CDN 短链接 → 强力推荐 aria2c
-        if aria2:
-            print(f"\n  [*] CDN 短链接: 自动使用 aria2c 全速下载")
-            use_aria2 = True
-        elif total_size > 100 * 1024 * 1024:
-            print(f"\n  [*] CDN 短链接 ({format_size(total_size)}): 需 aria2c 才能全速")
-            aria2 = install_aria2c_interactive()
-            use_aria2 = bool(aria2)
-    elif aria2:
-        # 普通链接 → 询问用户（默认不使用）
+    if aria2:
         print(f"\n  [>] 检测到 aria2c")
-        print(f"  [>] 输入 n=使用 aria2c（高速），回车/Y=使用 Python（可视化进度）：")
+        print(f"  [>] 输入 n=使用 aria2c（高速），回车/Y=使用多线程（可视化进度）：")
         choice = input("  -> ").strip().lower()
         use_aria2 = choice == "n"
     elif total_size > 100 * 1024 * 1024:
@@ -1077,13 +1075,20 @@ def run_http_download(url: str, dest: str, num_threads: int):
         print("  [!] aria2c 下载失败，回退到 Python 下载...\n")
 
     # ── Python 多线程 / 单线程 ────────────────
+    # 注册 Ctrl+C 中断处理器
+    signal.signal(signal.SIGINT, _interrupt_handler)
 
     if supports_range and num_threads > 1 and total_size > 0:
-        print(f"  [*] 使用 {num_threads} 线程并行下载\n")
+        print(f"\n  [*] 使用 {num_threads} 线程并行下载")
         _multi_thread_download(final_url, dest, total_size, num_threads)
     else:
         if num_threads > 1 and total_size > 0 and not supports_range:
-            print("  [!] 服务器不支持 Range 请求，回退到单线程")
+            print(f"\n  [!] 服务器不支持 Range 请求，无法使用 {num_threads} 线程")
+            print(f"  [>] 是否使用单线程下载？[Y/n]：")
+            choice = input("  -> ").strip().lower()
+            if choice == "n":
+                print("  [*] 已取消下载\n")
+                return
         elif total_size == 0:
             print("  [!] 无法确定文件大小，使用单线程下载")
         print("  [*] 使用单线程下载\n")
@@ -1179,7 +1184,7 @@ def _do_single_download(url: str, dest: str, total_size: int):
 
 def _multi_thread_download(url: str, dest: str, total_size: int,
                             num_threads: int):
-    global done_flag
+    global done_flag, _part_files
 
     chunk_sz = total_size // num_threads
     ranges_data = []
@@ -1189,9 +1194,11 @@ def _multi_thread_download(url: str, dest: str, total_size: int,
         ranges_data.append((start, end, i))
 
     part_files = []
+    _part_files = []  # 重置碎片追踪
     for start, end, idx in ranges_data:
         pf = f"{dest}.part{idx}"
         part_files.append(pf)
+        _register_part_file(pf)
         if os.path.exists(pf):
             os.remove(pf)
         with open(pf, "wb") as f:
@@ -1228,6 +1235,7 @@ def _multi_thread_download(url: str, dest: str, total_size: int,
                         break
                     out.write(data)
             os.remove(pf)
+    _part_files = []  # 合并完成，清除追踪
     print("  [OK] 合并完成")
 
 
