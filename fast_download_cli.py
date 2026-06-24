@@ -174,6 +174,15 @@ def extract_filename_from_url(url: str) -> str:
     return None
 
 
+def is_script_filename(name: str) -> bool:
+    """检测是否是指向脚本/网关的文件名（如 index.php、download.asp）"""
+    if not name:
+        return False
+    script_exts = {".php", ".asp", ".aspx", ".jsp", ".cgi", ".pl", ".py", ".rb"}
+    _, ext = os.path.splitext(name.lower())
+    return ext in script_exts
+
+
 def resolve_filename(url: str, resp=None) -> tuple:
     """
     智能解析文件名
@@ -1099,7 +1108,29 @@ def main():
                              })
     except Exception:
         resp = None
+        final_url, referer = url, ""
     filename, _ = resolve_filename(url, resp)
+
+    # 如果文件名是脚本类型(index.php/download.asp) → GET 探测真实 Content-Disposition
+    if filename and is_script_filename(filename):
+        print(f"\r  [*] 检测到网关链接({filename})，正在获取真实文件名...", end="", flush=True)
+        try:
+            probe_headers = {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) "
+                              "Chrome/120.0.0.0 Safari/537.36",
+                "Range": "bytes=0-0",
+            }
+            probed = requests.get(final_url or url, headers=probe_headers,
+                                  timeout=30, stream=True)
+            new_name, _ = resolve_filename(final_url or url, probed)
+            if new_name and not is_script_filename(new_name):
+                filename = new_name
+            else:
+                filename = None  # GET 探测也失败，交给用户手动输入
+            probed.close()
+        except Exception:
+            filename = None  # 网络异常也交给用户手动输入
 
     if filename:
         print(f"\r  [>] 文件名: {filename}")
