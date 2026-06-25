@@ -12,14 +12,11 @@ import time
 import ctypes
 import base64
 import shutil
-import socket
-import struct
-import random
+import signal
 import subprocess
 import threading
 import requests
-import signal
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 from urllib.parse import urlparse, unquote
 
 # ── 启用 Windows ANSI 转义序列 ────────────────────────
@@ -32,31 +29,29 @@ CHUNK_SIZE = 1024 * 1024
 CONNECT_TIMEOUT = 30
 READ_TIMEOUT = 300
 MAX_RETRIES = 10
-
-# DNS 服务器列表
-DNS_SERVERS = {
-    "ali":      ("223.5.5.5",        "阿里 DNS"),
-    "dnspod":   ("119.29.29.29",     "DNSPod"),
-    "baidu":    ("180.76.76.76",     "百度 DNS"),
-    "cn_114":   ("114.114.114.114",  "114 DNS"),
-    "google":   ("8.8.8.8",          "Google DNS"),
-    "cf":       ("1.1.1.1",          "Cloudflare"),
-}
-
-# 中国网站域名特征（自动使用国内 DNS）
-CN_TLDS = {".cn", ".com.cn", ".net.cn", ".org.cn", ".gov.cn", ".edu.cn"}
-CN_DOMAINS = {  # 知名国内站点及中文命名的域名
-    "msdngho.com", "yunzhongzhuan.com", "lanzou.com", "lanzoux.com",
-    "baidu.com", "aliyun.com", "alibaba.com", "jd.com", "taobao.com",
-    "bilibili.com", "zhihu.com", "csdn.net", "oschina.net",
-    "123pan.com", "quark.cn", "gitee.com", "coding.net",
-    "woozooo.com", "蓝奏.com", "pan.baidu.com",
-}
-
-DEFAULT_CN_DNS = "ali"   # 国内默认 DNS
-DEFAULT_GLOBAL_DNS = "cf"  # 国际默认 DNS
-DNS_TIMEOUT = 5  # DNS 查询超时（秒）
 ARIA2C_URL = "https://github.com/aria2/aria2/releases/download/release-1.37.0/aria2-1.37.0-win-64bit-build1.zip"
+
+# ── 共享 HTTP Session（大连接池，避免多线程竞争）──
+from requests.adapters import HTTPAdapter
+
+_shared_session = None
+_session_lock = threading.Lock()
+
+def _get_shared_session() -> requests.Session:
+    global _shared_session
+    if _shared_session is None:
+        with _session_lock:
+            if _shared_session is None:
+                s = requests.Session()
+                adapter = HTTPAdapter(
+                    pool_connections=64,
+                    pool_maxsize=64,
+                    pool_block=False,
+                )
+                s.mount("http://", adapter)
+                s.mount("https://", adapter)
+                _shared_session = s
+    return _shared_session
 
 # ── 全局状态 ──────────────────────────────────────────
 progress_lock = threading.Lock()
@@ -67,37 +62,10 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 global_referer = ""  # 全局 Referer，用于防盗链 CDN
 global_cookies = {}  # 全局 Cookie，用于重定向链认证
 global_download_url = ""  # 解析重定向后的最终 URL
-global_dns_orig_host = ""  # 智能 DNS 解析时的原始域名（用于 Host 头）
-global_dns_used = False  # 是否启用了自定义 DNS
-
-# ── 碎片文件追踪（用于 Ctrl+C 中断清理）──────
-_part_files = []
-_dest_file = ""
-
-def _register_part_file(path: str):
-    """注册需要清理的碎片文件"""
-    _part_files.append(path)
-
-def _cleanup_all_parts():
-    """清理所有多线程碎片文件"""
-    global _part_files
-    for f in _part_files:
-        try:
-            if os.path.exists(f):
-                os.remove(f)
-        except Exception:
-            pass
-    _part_files = []
-
-def _interrupt_handler(sig, frame):
-    """Ctrl+C 中断处理器 — 清理碎片后退出"""
-    print("\n\n  [!] 用户中断下载")
-    if _part_files:
-        print(f"  [*] 正在清理 {len(_part_files)} 个碎片文件...")
-        _cleanup_all_parts()
-        print("  [*] 清理完成")
-    print("  [*] 已退出\n")
-    os._exit(0)
+global_part_files = []  # 多线程下载的碎片文件列表（用于 Ctrl+C 清理）
+stop_event = threading.Event()  # Ctrl+C 停止信号
+thread_progress = {}  # 每线程下载量: {thread_idx: bytes}
+thread_speed = {}  # 每线程瞬时速度: {thread_idx: bytes_per_sec}
 
 
 # ═══════════════════════════════════════════════════════
@@ -125,6 +93,56 @@ def format_time(seconds: float) -> str:
         h, r = divmod(seconds, 3600)
         m = r // 60
         return f"{h:.0f}h{m:.0f}m"
+
+
+def cleanup_part_files():
+    """删除所有多线程下载产生的碎片文件"""
+    global global_part_files
+    remaining = list(global_part_files)
+    global_part_files.clear()
+
+    # 多轮重试，确保文件句柄全部释放
+    for attempt in range(20):
+        if not remaining:
+            break
+        still_there = []
+        for pf in remaining:
+            try:
+                if os.path.exists(pf):
+                    os.remove(pf)
+            except (PermissionError, OSError):
+                still_there.append(pf)
+            except Exception:
+                pass
+        remaining = still_there
+        if remaining and attempt < 19:
+            time.sleep(0.5)  # 等线程释放文件句柄
+
+    # 最后兜底：打印未删除的文件
+    if remaining:
+        for pf in remaining:
+            if os.path.exists(pf):
+                print(f"\n  [!] 无法删除碎片文件: {pf} (可能被其他程序占用)")
+
+
+def stop_handler(*args):
+    """设置停止标志，让各线程自然退出"""
+    global stop_event, done_flag
+    if not stop_event.is_set():
+        stop_event.set()
+        done_flag = True
+        print("\n  [*] 停止信号已发出，等待线程退出...")
+
+
+# Windows 上使用 SetConsoleCtrlHandler 处理 Ctrl+C，比 signal 更可靠
+if sys.platform == "win32":
+    _WIN_CTRL_C_EVENT = 0
+    _PHANDLER_ROUTINE = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+    _handler = _PHANDLER_ROUTINE(lambda e: (stop_handler(), True)[1])
+    if not kernel32.SetConsoleCtrlHandler(_handler, True):
+        pass  # 注册失败则回退到 signal
+else:
+    signal.signal(signal.SIGINT, lambda sig, frame: stop_handler())
 
 
 # ═══════════════════════════════════════════════════════
@@ -161,12 +179,10 @@ def decode_thunder(thunder_url: str) -> str:
         return thunder_url
     encoded = thunder_url[10:]
     try:
-        # Base64 补齐
         padding = 4 - len(encoded) % 4
         if padding != 4:
             encoded += "=" * padding
         decoded = base64.b64decode(encoded)
-        # 尝试 UTF-8 / GBK
         for enc in ["utf-8", "gbk", "gb2312"]:
             try:
                 text = decoded.decode(enc)
@@ -190,15 +206,12 @@ def parse_content_disposition(cd: str) -> str:
     """
     if not cd:
         return None
-    # UTF-8 编码: filename*=UTF-8''%e6%96%87%e4%bb%b6
     m = re.search(r"filename\*=(?:UTF-8|utf-8)''([^;]+)", cd, re.I)
     if m:
         return unquote(m.group(1))
-    # 带引号: filename="xxx"
     m = re.search(r'filename="([^"]+)"', cd, re.I)
     if m:
         return m.group(1)
-    # 不带引号: filename=xxx
     m = re.search(r"filename=([^;]+)", cd, re.I)
     if m:
         val = m.group(1).strip().strip('"')
@@ -215,33 +228,21 @@ def extract_filename_from_url(url: str) -> str:
     return None
 
 
-def is_script_filename(name: str) -> bool:
-    """检测是否是指向脚本/网关的文件名（如 index.php、download.asp）"""
-    if not name:
-        return False
-    script_exts = {".php", ".asp", ".aspx", ".jsp", ".cgi", ".pl", ".py", ".rb"}
-    _, ext = os.path.splitext(name.lower())
-    return ext in script_exts
-
-
 def resolve_filename(url: str, resp=None) -> tuple:
     """
     智能解析文件名
     优先级: Content-Disposition > 最终 URL 路径 > 原始 URL 路径
     返回: (filename_or_none, response_or_none)
     """
-    # 1. 从 Content-Disposition 获取
     if resp is not None:
         cd = resp.headers.get("Content-Disposition", "")
         fname = parse_content_disposition(cd)
         if fname:
             return fname, resp
-        # 2. 从最终 URL 路径获取
         fname = extract_filename_from_url(resp.url)
         if fname:
             return fname, resp
 
-    # 3. 从原始 URL 路径获取
     fname = extract_filename_from_url(url)
     if fname:
         return fname, resp
@@ -255,18 +256,15 @@ def resolve_filename(url: str, resp=None) -> tuple:
 
 def find_aria2c() -> str:
     """查找 aria2c 可执行文件"""
-    # 1. PATH 中查找
     path = shutil.which("aria2c")
     if path:
         return path
 
-    # 2. 脚本同目录
     script_dir = os.path.dirname(os.path.abspath(__file__))
     local = os.path.join(script_dir, "aria2c.exe")
     if os.path.exists(local):
         return local
 
-    # 3. 常见位置
     common = [
         os.path.join(os.path.expanduser("~"), "scoop", "shims", "aria2c.exe"),
         r"C:\Program Files\aria2\aria2c.exe",
@@ -284,14 +282,13 @@ def install_aria2c_interactive() -> str:
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     print("\n  [*] 未找到 aria2c，它是高性能多线程下载工具 (6MB)")
-    print("  [>] 安装后 HTTP 下载速度可提升 100 倍")
+    print("  [>] 安装后 HTTP 下载速度可大幅提升")
     choice = input("  [>] 是否自动下载安装? [Y/n]: ").strip().lower()
 
     if choice and choice not in ("y", "yes"):
         print("  [!] 跳过安装")
         return None
 
-    # 下载 aria2c
     import zipfile
     import io
 
@@ -313,11 +310,9 @@ def install_aria2c_interactive() -> str:
                     sys.stdout.flush()
         print()
 
-        # 解压
         print("  [*] 解压中...")
         data.seek(0)
         with zipfile.ZipFile(data) as zf:
-            # 找到 aria2c.exe
             aria2_exe = None
             for name in zf.namelist():
                 if name.endswith("aria2c.exe"):
@@ -326,14 +321,11 @@ def install_aria2c_interactive() -> str:
             if not aria2_exe:
                 print("  [!] 压缩包中未找到 aria2c.exe")
                 return None
-            # 解压到脚本目录
             zf.extract(aria2_exe, script_dir)
-            # 如果有多层目录，移动出来
             extracted = os.path.join(script_dir, aria2_exe)
             target = os.path.join(script_dir, "aria2c.exe")
             if extracted != target:
                 shutil.move(extracted, target)
-                # 清理空目录
                 parent = os.path.dirname(extracted)
                 try:
                     while parent != script_dir:
@@ -365,12 +357,6 @@ def download_via_aria2(url: str, dest: str):
     print(f"  [>] 目标: {dest}")
     print()
 
-    # aria2c 参数:
-    #   --seed-time=0     完成后不做种
-    #   --file-allocation=none  不预分配(SSD友好)
-    #   --console-log-level=notice  只显示进度
-    #   --summary-interval=0  不显示汇总
-    #   -d 指定目录, -o 指定文件名
     dest_dir = os.path.dirname(dest) or "."
     dest_name = os.path.basename(dest)
 
@@ -395,9 +381,7 @@ def download_via_aria2(url: str, dest: str):
             errors="replace",
             bufsize=1,
         )
-        # 实时输出 aria2c 的进度
         for line in proc.stdout:
-            # aria2c 输出自带 \r 回车刷新，直接打印
             sys.stdout.write("  " + line.rstrip() + "\r")
             sys.stdout.flush()
         proc.wait()
@@ -413,7 +397,7 @@ def download_via_aria2(url: str, dest: str):
 
 
 def download_http_via_aria2(url: str, dest: str, num_connections: int = 16):
-    """使用 aria2c 进行 HTTP 多连接下载（速度远快于 Python requests）"""
+    """使用 aria2c 进行 HTTP 多连接下载"""
     aria2 = find_aria2c()
     if not aria2:
         aria2 = install_aria2c_interactive()
@@ -429,11 +413,11 @@ def download_http_via_aria2(url: str, dest: str, num_connections: int = 16):
 
     cmd = [
         aria2,
-        f"--split={num_connections}",       # 多连接（分片下载）
+        f"--split={num_connections}",
         f"--max-connection-per-server={num_connections}",
-        "--min-split-size=1M",              # 最小分片 1MB
-        "--file-allocation=none",           # 不预分配（SSD 友好）
-        "--continue=true",                  # 断点续传
+        "--min-split-size=1M",
+        "--file-allocation=none",
+        "--continue=true",
         "--console-log-level=notice",
         "--summary-interval=0",
         f"--dir={dest_dir}",
@@ -469,218 +453,14 @@ def download_http_via_aria2(url: str, dest: str, num_connections: int = 16):
 
 
 # ═══════════════════════════════════════════════════════
-# 智能 DNS 解析 — 绕过 VPN/代理导致的 DNS 污染
+# HTTP 下载核心
 # ═══════════════════════════════════════════════════════
-
-def _encode_dns_name(hostname: str) -> bytes:
-    """将域名编码为 DNS 查询格式：长度前缀 + 字节"""
-    result = bytearray()
-    for label in hostname.encode("idna").split(b"."):
-        result.append(len(label))
-        result.extend(label)
-    result.append(0)
-    return bytes(result)
-
-
-def _decode_dns_name(data: bytes, offset: int) -> tuple:
-    """从 DNS 响应中解码域名，返回 (域名, 新偏移)"""
-    labels = []
-    jumped = False
-    orig_offset = offset
-    max_hops = 20
-
-    for _ in range(max_hops):
-        length = data[offset]
-        if length == 0:
-            offset += 1
-            break
-        if length & 0xC0:  # 指针
-            ptr = ((length & 0x3F) << 8) | data[offset + 1]
-            offset += 2
-            if not jumped:
-                orig_offset = offset
-                jumped = True
-            sub_labels, _ = _decode_dns_name(data, ptr)
-            labels.extend(sub_labels)
-            break
-        else:
-            offset += 1
-            labels.append(data[offset:offset + length].decode("ascii", errors="replace"))
-            offset += length
-
-    return labels, (orig_offset if jumped else offset)
-
-
-def _is_ipv4(s: str) -> bool:
-    """判断字符串是否为合法 IPv4 地址"""
-    parts = s.split(".")
-    if len(parts) != 4:
-        return False
-    try:
-        return all(0 <= int(p) <= 255 for p in parts)
-    except (ValueError, TypeError):
-        return False
-
-
-def dns_resolve(hostname: str, dns_server: str = "223.5.5.5", timeout: int = DNS_TIMEOUT) -> list:
-    """使用指定 DNS 服务器解析域名，返回 IP 列表"""
-    txid = random.randint(0, 0xFFFF)
-
-    # 构造 DNS 查询包
-    header = struct.pack("!HHHHHH", txid, 0x0100, 1, 0, 0, 0)
-    question = _encode_dns_name(hostname) + struct.pack("!HH", 1, 1)  # A 记录, IN 类
-    packet = header + question
-
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(timeout)
-    try:
-        sock.sendto(packet, (dns_server, 53))
-        response, _ = sock.recvfrom(1024)
-    finally:
-        sock.close()
-
-    # 解析响应
-    resp_id, flags, qdcount, ancount, nscount, arcount = struct.unpack("!HHHHHH", response[:12])
-    if resp_id != txid:
-        return []
-    if ancount == 0:
-        return []
-
-    # 跳过问题段
-    offset = 12
-    for _ in range(qdcount):
-        _, offset = _decode_dns_name(response, offset)
-        offset += 4  # QTYPE + QCLASS
-
-    # 解析答案段
-    ips = []
-    for _ in range(ancount):
-        _, offset = _decode_dns_name(response, offset)
-        rtype, rclass, ttl, rdlength = struct.unpack("!HHIH", response[offset:offset + 10])
-        offset += 10
-        if rtype == 1 and rclass == 1 and rdlength == 4:  # A 记录
-            ip = ".".join(str(b) for b in response[offset:offset + 4])
-            ips.append(ip)
-        offset += rdlength
-
-    return ips
-
-
-def is_chinese_site(hostname: str) -> bool:
-    """检测是否为中国网站（自动匹配国内 DNS）"""
-    host_lower = hostname.lower()
-    # TLD 检测
-    for tld in CN_TLDS:
-        if host_lower.endswith(tld):
-            return True
-    # 域名特征匹配
-    for cn_domain in CN_DOMAINS:
-        if host_lower == cn_domain or host_lower.endswith("." + cn_domain):
-            return True
-    return False
-
-
-def resolve_hostname_smart(hostname: str, preferred_dns: str = None) -> str:
-    """
-    智能解析域名：
-    1. 先用系统 DNS 尝试
-    2. 如果是中国网站或系统 DNS 失败 → 国内 DNS
-    3. 如果仍然失败 → 依次尝试所有 DNS
-    返回 IP 或原 hostname（全部失败时）
-    """
-    # 已经是 IP 则直接返回
-    try:
-        parts = hostname.split(".")
-        if len(parts) == 4 and all(p.isdigit() and 0 <= int(p) <= 255 for p in parts):
-            return hostname
-    except Exception:
-        pass
-
-    is_cn = is_chinese_site(hostname)
-
-    # 1. 系统 DNS
-    for attempt in range(3):
-        try:
-            ai = socket.getaddrinfo(hostname, 80, socket.AF_INET, socket.SOCK_STREAM)
-            ip = ai[0][4][0]
-            if ip:
-                return hostname  # 系统 DNS 成功，保留域名（Cookie/SSL 兼容性）
-        except socket.gaierror:
-            time.sleep(0.5)
-
-    # 2. 系统 DNS 失败 → 智能选择
-    dns_keys = []
-    if preferred_dns:
-        dns_keys.append(preferred_dns)
-    if is_cn:
-        dns_keys.extend(["ali", "dnspod", "cn_114", "baidu"])
-    else:
-        dns_keys.extend(["cf", "google", "ali", "dnspod"])
-
-    for key in dns_keys:
-        if key not in DNS_SERVERS:
-            continue
-        server, name = DNS_SERVERS[key]
-        ips = dns_resolve(hostname, server)
-        if ips:
-            return ips[0]  # 返回 IP
-
-    return hostname  # 全部失败，保持原样让 requests 自己处理
-
-
-def url_with_host_resolved(url: str, use_smart_dns: bool = True) -> tuple:
-    """
-    尝试用智能 DNS 解析 URL 中的主机名。
-    返回: (解析后的 URL, 原始 hostname, 是否用了自定义 DNS)
-    """
-    if not use_smart_dns:
-        return url, "", False
-
-    parsed = urlparse(url)
-    hostname = parsed.hostname
-    if not hostname:
-        return url, "", False
-
-    resolved = resolve_hostname_smart(hostname)
-    if resolved == hostname:
-        return url, hostname, False  # 系统 DNS 正常
-
-    # 替换 hostname 为 IP
-    netloc = parsed.netloc.replace(hostname, resolved, 1)
-    if parsed.port:
-        netloc = netloc.replace(f":{parsed.port}", f":{parsed.port}", 1)  # 保持端口
-    new_url = parsed._replace(netloc=netloc).geturl()
-    return new_url, hostname, True
 
 def resolve_url_with_referer(url: str) -> tuple:
     """
     手动跟随重定向，记录各跳转 Host 用作 Referer + 保存 Cookie
     返回: (最终URL, referer_chain, final_headers, cookies)
     """
-    global global_dns_orig_host, global_dns_used
-
-    # ── 智能 DNS：先解析域名 ──
-    parsed_init = urlparse(url)
-    orig_host = parsed_init.hostname or ""
-    global_dns_orig_host = ""
-    global_dns_used = False
-
-    if orig_host and parsed_init.scheme in ("http", "https"):
-        resolved = resolve_hostname_smart(orig_host)
-        if resolved != orig_host:
-            # 自定义 DNS 成功 → 用 IP 替换，保留 Host 头
-            netloc = resolved
-            if parsed_init.port:
-                netloc = f"{resolved}:{parsed_init.port}"
-            current_url = parsed_init._replace(netloc=netloc).geturl()
-            global_dns_orig_host = orig_host
-            global_dns_used = True
-            print(f"\n  [*] 智能 DNS: {orig_host} -> {resolved} (系统 DNS 不通)")
-        else:
-            current_url = url
-    else:
-        current_url = url
-
     session = requests.Session()
     referer = ""
     headers = {
@@ -688,8 +468,7 @@ def resolve_url_with_referer(url: str) -> tuple:
                       "AppleWebKit/537.36 (KHTML, like Gecko) "
                       "Chrome/120.0.0.0 Safari/537.36",
     }
-    if global_dns_used:
-        headers["Host"] = global_dns_orig_host
+    current_url = url
     visited = set()
     max_hops = 10
 
@@ -701,24 +480,16 @@ def resolve_url_with_referer(url: str) -> tuple:
         if referer:
             req_headers["Referer"] = referer
 
-        # 如果当前 URL 的 host 是 IP（由 DNS 解析而来），保持 Host 头
-        current_hostname = parsed.hostname or ""
-        if global_dns_used and _is_ipv4(current_hostname):
-            req_headers["Host"] = global_dns_orig_host
-
         resp = session.head(current_url, allow_redirects=False,
                             timeout=30, headers=req_headers)
         location = resp.headers.get("Location", "")
 
         if not location or resp.status_code not in (301, 302, 303, 307, 308):
-            # 最后一跳 — referer 保持为来源站点的域名
             cookies = session.cookies.get_dict()
             return current_url, referer, dict(resp.headers), cookies
 
-        # 仅当还有下一跳时才更新 referer 为当前域
-        referer = f"{parsed.scheme}://{parsed.netloc}"
+        referer = current_url  # 使用完整 URL（含路径），xiaoguanqiu.com 等需要校验此 Referer
 
-        # 处理相对路径
         if location.startswith("/"):
             location = f"{parsed.scheme}://{parsed.netloc}{location}"
         elif not location.startswith("http"):
@@ -736,7 +507,7 @@ def resolve_url_with_referer(url: str) -> tuple:
 
 def get_file_info(url: str) -> tuple:
     """获取文件大小、Range 支持（使用已有的 global_referer / global_cookies）"""
-    global global_referer, global_cookies, global_dns_used, global_dns_orig_host
+    global global_referer, global_cookies
     print("\n  [*] 正在获取文件信息...", end="", flush=True)
 
     req_headers = {
@@ -746,11 +517,8 @@ def get_file_info(url: str) -> tuple:
     }
     if global_referer:
         req_headers["Referer"] = global_referer
-    if global_dns_used and global_dns_orig_host:
-        req_headers["Host"] = global_dns_orig_host
 
     def _is_error(resp_obj, clen, ctype):
-        """检测响应是否为错误页面"""
         if resp_obj.status_code >= 400:
             return True
         if clen > 0 and clen < 10000 and ("xml" in ctype.lower() or
@@ -759,12 +527,10 @@ def get_file_info(url: str) -> tuple:
         return False
 
     try:
-        # 策略 1: GET Range bytes=0-0 探测（最可靠，CDN 必须支持 GET）
         probe_headers = dict(req_headers)
         probe_headers["Range"] = "bytes=0-0"
         resp = requests.get(url, timeout=30, headers=probe_headers,
                             cookies=global_cookies, stream=True)
-        # 立即关闭 body
         resp.close()
 
         size = 0
@@ -785,7 +551,6 @@ def get_file_info(url: str) -> tuple:
             print(f"\r  [!] 服务器返回错误: HTTP {resp.status_code}, {content_type}, "
                   f"{size} 字节")
             print(f"  [!] 可能原因: 防盗链/链接过期/需要登录")
-            # 打印服务器返回的实际内容
             try:
                 body_resp = requests.get(url, timeout=30, headers=req_headers,
                                          cookies=global_cookies)
@@ -796,7 +561,6 @@ def get_file_info(url: str) -> tuple:
             return 0, False, resp
 
         if size == 0:
-            # 最后尝试 HEAD
             try:
                 resp_head = requests.head(url, allow_redirects=False, timeout=30,
                                           headers=req_headers,
@@ -819,7 +583,7 @@ def get_file_info(url: str) -> tuple:
 
 def download_chunk(idx: int, url: str, start: int, end: int, part_file: str):
     """下载一个分块，支持断点续传"""
-    global total_downloaded, global_referer, global_cookies, global_dns_used, global_dns_orig_host
+    global total_downloaded, global_referer, global_cookies, stop_event, thread_progress
     current = start
     retries = 0
 
@@ -830,20 +594,22 @@ def download_chunk(idx: int, url: str, start: int, end: int, part_file: str):
     }
     if global_referer:
         base_headers["Referer"] = global_referer
-    if global_dns_used and global_dns_orig_host:
-        base_headers["Host"] = global_dns_orig_host
 
-    while retries < MAX_RETRIES:
+    session = _get_shared_session()
+
+    while retries < MAX_RETRIES and not stop_event.is_set():
         try:
             headers = dict(base_headers)
             headers["Range"] = f"bytes={current}-{end}"
-            resp = requests.get(url, headers=headers, stream=True,
-                                cookies=global_cookies,
-                                timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
+            resp = session.get(url, headers=headers, stream=True,
+                               cookies=global_cookies,
+                               timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             if resp.status_code not in (200, 206):
                 if resp.status_code in (403, 404, 410):
                     print(f"\n  [!] 线程 #{idx+1} HTTP {resp.status_code}: 链接无效或防盗链")
+                    resp.close()
                     return 0
+                resp.close()
                 retries += 1
                 time.sleep(min(2 ** retries, 30))
                 continue
@@ -851,13 +617,20 @@ def download_chunk(idx: int, url: str, start: int, end: int, part_file: str):
             with open(part_file, "r+b") as f:
                 f.seek(current - start)
                 for chunk in resp.iter_content(chunk_size=CHUNK_SIZE):
+                    if stop_event.is_set():
+                        resp.close()
+                        return current - start
                     if chunk:
                         f.write(chunk)
                         current += len(chunk)
                         with progress_lock:
                             total_downloaded += len(chunk)
+                            thread_progress[idx] = current - start
+            resp.close()
             return current - start
         except Exception:
+            if stop_event.is_set():
+                return current - start
             retries += 1
             time.sleep(min(2 ** retries, 30))
     return current - start
@@ -866,7 +639,6 @@ def download_chunk(idx: int, url: str, start: int, end: int, part_file: str):
 def single_thread_download(url: str, dest: str, total_size: int):
     """单线程下载"""
     global total_downloaded, start_time, done_flag, global_referer, global_cookies
-    global global_dns_used, global_dns_orig_host
     start_time = time.time()
     downloaded = 0
 
@@ -877,14 +649,11 @@ def single_thread_download(url: str, dest: str, total_size: int):
     }
     if global_referer:
         req_headers["Referer"] = global_referer
-    if global_dns_used and global_dns_orig_host:
-        req_headers["Host"] = global_dns_orig_host
 
     resp = requests.get(url, stream=True,
                         timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
                         headers=req_headers,
                         cookies=global_cookies)
-    # 检测错误响应
     ct = resp.headers.get("Content-Type", "")
     cl = resp.headers.get("Content-Length", "")
     if resp.status_code == 403 or ("xml" in ct.lower() and cl and int(cl) < 10000):
@@ -906,54 +675,116 @@ def single_thread_download(url: str, dest: str, total_size: int):
 # 进度渲染（多行 ANSI）
 # ═══════════════════════════════════════════════════════
 
-def progress_renderer(total_size: int):
-    """单行总进度渲染（Linux wget/curl 风格）"""
-    global total_downloaded, done_flag
+def progress_renderer(total_size: int, num_threads: int):
+    """多线程多行进度渲染：每线程独立进度+实时速度 + 总进度"""
+    global total_downloaded, done_flag, thread_progress, thread_speed
 
     while total_downloaded == 0 and not done_flag:
         time.sleep(0.5)
 
-    last_downloaded = 0
+    last_total = 0
     last_time = start_time
     speed_samples = []
 
+    # 每线程上一轮数据（用于计算速度）
+    thread_last = {i: 0 for i in range(num_threads)}
+    thread_last_time = {i: start_time for i in range(num_threads)}
+
+    print()  # 留空行供多行渲染
+
     while not done_flag:
         now = time.time()
-        elapsed = now - start_time
         dt = now - last_time
-        dd = total_downloaded - last_downloaded
+        dd = total_downloaded - last_total
         if dt > 0:
             speed_samples.append(dd / dt)
             if len(speed_samples) > 10:
                 speed_samples.pop(0)
         avg_speed = sum(speed_samples) / len(speed_samples) if speed_samples else 0
 
-        if total_size > 0 and total_downloaded > 0:
+        chunk_sz = total_size // num_threads if total_size > 0 else 0
+
+        # 快照
+        with progress_lock:
+            tp_snapshot = dict(thread_progress)
+
+        lines = []
+
+        # 计算每个线程的即时速度
+        for i in range(num_threads):
+            downloaded = tp_snapshot.get(i, 0)
+            thread_total = chunk_sz if i < num_threads - 1 else (total_size - (num_threads - 1) * chunk_sz)
+
+            # 计算该线程速度
+            t_dd = downloaded - thread_last[i]
+            t_dt = now - thread_last_time[i]
+            if t_dt > 0:
+                t_speed = t_dd / t_dt
+            else:
+                t_speed = 0
+            thread_speed[i] = t_speed
+
+            thread_last[i] = downloaded
+            thread_last_time[i] = now
+
+            if thread_total > 0:
+                pct = downloaded / thread_total * 100
+                bar_w = 20
+                filled = int(bar_w * pct / 100)
+                bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
+                lines.append(f"  线程 #{i+1:2d}  {bar}  {pct:5.1f}%  "
+                             f"{format_size(downloaded)}/{format_size(thread_total)}  "
+                             f"{format_size(t_speed)}/s")
+            else:
+                lines.append(f"  线程 #{i+1:2d}  {format_size(downloaded)}  (待开始)")
+
+        # 总进度
+        if total_size > 0:
             pct = total_downloaded / total_size * 100
             bar_w = 35
             filled = int(bar_w * total_downloaded / total_size)
             bar = "\u2588" * filled + "\u2591" * (bar_w - filled)
             eta_str = format_time((total_size - total_downloaded) / avg_speed) if avg_speed > 0 else "--:--"
-            line = (f"\r  {bar}  {pct:5.1f}%  "
-                    f"{format_size(total_downloaded)}/{format_size(total_size)}  "
-                    f"{format_size(avg_speed)}/s  "
-                    f"耗时 {format_time(elapsed)}  ETA {eta_str}")
+            total_line = (f"  总计     {bar}  {pct:5.1f}%  "
+                          f"{format_size(total_downloaded)}/{format_size(total_size)}  "
+                          f"{format_size(avg_speed)}/s  ETA {eta_str}")
         else:
-            line = f"\r  [*] 正在下载... {format_size(total_downloaded)}"
+            total_line = f"  总计     {format_size(total_downloaded)}"
 
-        sys.stdout.write("\033[K" + line)
+        lines.append(total_line)
+
+        # Ctrl+C 提示
+        lines.append("  \033[90m按 Ctrl+C 停止下载\033[0m")
+
+        # ANSI 渲染
+        total_lines = len(lines)
+        sys.stdout.write(f"\033[{total_lines}A")
+        for line in lines:
+            sys.stdout.write("\033[K" + line + "\n")
         sys.stdout.flush()
 
-        last_downloaded = total_downloaded
+        last_total = total_downloaded
         last_time = now
-        time.sleep(0.25)
+        time.sleep(0.3)
 
-    # 最终刷新
+    # 最终帧
+    chunk_sz_end = total_size // num_threads if total_size > 0 else 0
+    lines_end = []
+    for i in range(num_threads):
+        thread_total_end = chunk_sz_end if i < num_threads - 1 else (total_size - (num_threads - 1) * chunk_sz_end)
+        bar = "\u2588" * 20
+        lines_end.append(f"  线程 #{i+1:2d}  {bar}  100.0%  "
+                        f"{format_size(thread_total_end)}/{format_size(thread_total_end)}")
+
     elapsed = time.time() - start_time
     bar_final = "\u2588" * 35
-    sys.stdout.write(f"\r\033[K  {bar_final}  100.0%  "
-                     f"{format_size(total_size)}/{format_size(total_size)}  "
-                     f"耗时 {format_time(elapsed)}\n")
+    lines_end.append(f"  总计     {bar_final}  100.0%  "
+                     f"{format_size(total_size)}/{format_size(total_size)}  耗时 {format_time(elapsed)}")
+
+    tl = len(lines_end)
+    sys.stdout.write(f"\033[{tl}A")
+    for line in lines_end:
+        sys.stdout.write("\033[K" + line + "\n")
     sys.stdout.flush()
 
 
@@ -993,7 +824,7 @@ def progress_renderer_single(total_size: int):
             line = (f"\r  {format_size(total_downloaded)}  已用时 "
                     f"{format_time(elapsed)}  {format_size(avg_speed)}/s")
 
-        sys.stdout.write(line)
+        sys.stdout.write(line + "  \033[90mCtrl+C 停止\033[0m")
         sys.stdout.flush()
         last_downloaded = total_downloaded
         last_time = now
@@ -1018,15 +849,14 @@ def run_http_download(url: str, dest: str, num_threads: int):
     """HTTP(S) 下载入口"""
     global total_downloaded, start_time, done_flag
     global global_referer, global_cookies, global_download_url
-    global global_dns_used, global_dns_orig_host
+    global global_part_files
     total_downloaded = 0
     start_time = time.time()
     done_flag = False
     global_referer = ""
     global_cookies = {}
     global_download_url = ""
-    global_dns_used = False
-    global_dns_orig_host = ""
+    global_part_files = []
 
     # 1. 手动跟随重定向，获取最终 CDN URL、Referer、Cookie
     final_url, referer, _, cookies = resolve_url_with_referer(url)
@@ -1041,88 +871,71 @@ def run_http_download(url: str, dest: str, num_threads: int):
     total_size, supports_range, resp = get_file_info(final_url)
 
     if total_size == 0:
-        # 直接探测失败 → 尝试用原始短链接 + 自然重定向下载
         if final_url != url:
-            print("\n  [*] 直接请求失败，尝试通过短链接自然重定向下载...")
+            print("\n  [*] 直接请求失败，尝试通过原始链接流式下载...")
             _download_via_redirect_stream(url, dest)
         else:
             print("  [*] 文件信息获取失败，尝试直接流式下载...")
             _do_single_download(final_url, dest, 0)
         return
 
-    # ── 是否使用 aria2c？(仅询问，不自动切换) ──────
+    # ── 下载器选择（用户决定） ─────────────────
     use_aria2 = False
     aria2 = find_aria2c()
 
     if aria2:
+        # 检测到 aria2c，询问用户是否使用
         print(f"\n  [>] 检测到 aria2c")
-        print(f"  [>] 输入 n=使用 aria2c（高速），回车/Y=使用多线程（可视化进度）：")
-        choice = input("  -> ").strip().lower()
-        use_aria2 = choice == "n"
+        choice = input("  [>] 是否使用 aria2c 高速下载? [y/N]: ").strip().lower()
+        use_aria2 = choice in ("y", "yes")
     elif total_size > 100 * 1024 * 1024:
-        print(f"\n  [*] 文件较大 ({format_size(total_size)})")
-        print(f"  [>] 输入 n=安装 aria2c 加速，回车=跳过：")
-        choice = input("  -> ").strip().lower()
-        if choice == "n":
+        # 大文件且没有 aria2c，提示安装
+        print(f"\n  [*] 文件较大 ({format_size(total_size)})，推荐使用 aria2c 加速")
+        choice = input("  [>] 是否安装 aria2c? [y/N]: ").strip().lower()
+        if choice in ("y", "yes"):
             aria2 = install_aria2c_interactive()
             use_aria2 = bool(aria2)
 
     if use_aria2 and aria2:
-        print(f"  [*] 使用 aria2c 下载，{num_threads} 连接分片...")
         success = download_http_via_aria2(url, dest, num_threads)
         if success:
             return
-        print("  [!] aria2c 下载失败，回退到 Python 下载...\n")
+        print("  [!] aria2c 下载失败，回退到 Python 下载\n")
 
     # ── Python 多线程 / 单线程 ────────────────
-    # 注册 Ctrl+C 中断处理器
-    signal.signal(signal.SIGINT, _interrupt_handler)
-
     if supports_range and num_threads > 1 and total_size > 0:
-        print(f"\n  [*] 使用 {num_threads} 线程并行下载")
+        print(f"  [*] 使用 {num_threads} 线程并行下载\n")
         _multi_thread_download(final_url, dest, total_size, num_threads)
     else:
         if num_threads > 1 and total_size > 0 and not supports_range:
-            print(f"\n  [!] 服务器不支持 Range 请求，无法使用 {num_threads} 线程")
-            print(f"  [>] 是否使用单线程下载？[Y/n]：")
-            choice = input("  -> ").strip().lower()
-            if choice == "n":
-                print("  [*] 已取消下载\n")
-                return
-        elif total_size == 0:
-            print("  [!] 无法确定文件大小，使用单线程下载")
+            print(f"  [!] 服务器不支持 Range 请求，无法使用 {num_threads} 线程")
+            print(f"  [>] 将使用单线程下载")
         print("  [*] 使用单线程下载\n")
         _do_single_download(final_url, dest, total_size)
 
 
 def _download_via_redirect_stream(url: str, dest: str):
     """
-    通过短链接自然重定向下载 — 不手动解析 URL，让 HTTP 客户端跟随重定向
-    这是最接近 curl -L / 浏览器 / 群晖行为的模式
+    通过原始链接自然重定向下载
+    最接近 curl -L / 浏览器的行为
     """
-    global total_downloaded, start_time, done_flag, global_dns_used, global_dns_orig_host
+    global total_downloaded, start_time, done_flag
 
-    print(f"  [*] 通过短链接流式下载: {url[:80]}...")
+    print(f"  [*] 通过原始链接流式下载: {url[:80]}...")
     total_downloaded = 0
     start_time = time.time()
     done_flag = False
 
     try:
         session = requests.Session()
-        req_hdrs = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; "
-                          "Win64; x64) AppleWebKit/537.36 "
-                          "(KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36",
-        }
-        if global_dns_used and global_dns_orig_host:
-            req_hdrs["Host"] = global_dns_orig_host
-        if global_referer:
-            req_hdrs["Referer"] = global_referer
         resp = session.get(url, stream=True, allow_redirects=True,
                            timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-                           headers=req_hdrs,
-                           cookies=global_cookies)
+                           headers={
+                               "User-Agent": "Mozilla/5.0 (Windows NT 10.0; "
+                                             "Win64; x64) AppleWebKit/537.36 "
+                                             "(KHTML, like Gecko) "
+                                             "Chrome/120.0.0.0 Safari/537.36",
+                           })
 
         if resp.status_code >= 400:
             ct = resp.headers.get("Content-Type", "")
@@ -1140,7 +953,6 @@ def _download_via_redirect_stream(url: str, dest: str):
         else:
             print("  [*] 未知文件大小，正在下载...")
 
-        # 启动进度渲染
         printer = threading.Thread(target=progress_renderer_single,
                                     args=(total_size,), daemon=True)
         printer.start()
@@ -1184,7 +996,10 @@ def _do_single_download(url: str, dest: str, total_size: int):
 
 def _multi_thread_download(url: str, dest: str, total_size: int,
                             num_threads: int):
-    global done_flag, _part_files
+    global done_flag, global_part_files, thread_progress
+
+    # 初始化每线程进度
+    thread_progress = {i: 0 for i in range(num_threads)}
 
     chunk_sz = total_size // num_threads
     ranges_data = []
@@ -1194,36 +1009,61 @@ def _multi_thread_download(url: str, dest: str, total_size: int,
         ranges_data.append((start, end, i))
 
     part_files = []
-    _part_files = []  # 重置碎片追踪
     for start, end, idx in ranges_data:
         pf = f"{dest}.part{idx}"
         part_files.append(pf)
-        _register_part_file(pf)
         if os.path.exists(pf):
             os.remove(pf)
         with open(pf, "wb") as f:
             f.truncate(end - start + 1)
 
+    global_part_files = part_files[:]
+
     printer = threading.Thread(target=progress_renderer,
-                                args=(total_size,),
+                                args=(total_size, num_threads),
                                 daemon=True)
     printer.start()
 
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        futures = []
+    executor = None
+    futures = []
+    try:
+        executor = ThreadPoolExecutor(max_workers=num_threads)
         for start, end, idx in ranges_data:
-            futures.append(
-                executor.submit(download_chunk, idx, url, start, end,
-                                part_files[idx])
-            )
-        for future in as_completed(futures):
-            try:
-                future.result()
-            except Exception as e:
-                print(f"\n  [!] 某一线程出错: {e}")
+            future = executor.submit(download_chunk, idx, url, start, end,
+                                     part_files[idx])
+            futures.append(future)
+
+        # 使用 wait/FIRST_COMPLETED 轮询，每 0.5s 检查一次停止标志
+        pending = set(futures)
+        while pending and not stop_event.is_set():
+            done, pending = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+            for future in done:
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"\n  [!] 某一线程出错: {e}")
+
+    except KeyboardInterrupt:
+        stop_event.set()
+        print("\n\n  [*] 收到中断信号，正在停止所有线程...")
+    finally:
+        if executor:
+            executor.shutdown(wait=False)
+            # 等待所有线程完全退出（最多等 5 秒）
+            for _ in range(50):
+                if all(f.done() for f in futures):
+                    break
+                time.sleep(0.1)
 
     done_flag = True
     printer.join(timeout=2)
+
+    if stop_event.is_set():
+        print("\n  [*] 正在清理碎片文件...")
+        time.sleep(1.0)  # 给 OS 一点时间释放文件句柄
+        cleanup_part_files()
+        print("  [*] 碎片文件已清理")
+        return
 
     print("\n  [*] 正在合并分块...")
     with open(dest, "wb") as out:
@@ -1235,7 +1075,7 @@ def _multi_thread_download(url: str, dest: str, total_size: int,
                         break
                     out.write(data)
             os.remove(pf)
-    _part_files = []  # 合并完成，清除追踪
+    global_part_files.clear()
     print("  [OK] 合并完成")
 
 
@@ -1291,7 +1131,6 @@ def main():
                     f.write(chunk)
         print(f"  [OK] 种子已保存: {dest}")
 
-        # 使用种子文件下载
         success = download_via_aria2(dest, dest.replace(".torrent", ""))
         if not success:
             print("  [!] BT 下载未完成")
@@ -1301,7 +1140,6 @@ def main():
     # ── 磁力链接 → aria2c ──
     if link_type == LinkType.MAGNET:
         print("  [*] 这是一个磁力链接，将使用 aria2c 下载")
-        # 尝试从磁力链接提取文件名
         m = re.search(r"dn=([^&]+)", url, re.I)
         magnet_name = unquote(m.group(1)) if m else "magnet_download"
 
@@ -1311,7 +1149,6 @@ def main():
         user_path = input("  -> ").strip()
         dest = user_path if user_path else default_save
 
-        # 确认
         print("\n" + "-" * 60)
         print(f"  类型:     磁力链接 (BT)")
         print(f"  InfoHash: {url[20:60]}...")
@@ -1325,10 +1162,8 @@ def main():
 
         success = download_via_aria2(url, dest)
         if success:
-            # aria2c 可能给文件加了后缀，尝试找实际文件
             actual = dest
             if not os.path.exists(dest):
-                # 检查下载目录中是否有新文件
                 dest_dir = os.path.dirname(dest) or "."
                 files = sorted(
                     [f for f in os.listdir(dest_dir)
@@ -1358,25 +1193,25 @@ def main():
     print("\n  [*] 正在解析文件名...", end="", flush=True)
     try:
         final_url, referer, _, _cookies = resolve_url_with_referer(url)
-        head_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36",
-        }
-        if referer:
-            head_headers["Referer"] = referer
-        if global_dns_used and global_dns_orig_host:
-            head_headers["Host"] = global_dns_orig_host
         resp = requests.head(final_url, allow_redirects=False, timeout=30,
-                             headers=head_headers)
+                             headers={
+                                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                               "Chrome/120.0.0.0 Safari/537.36",
+                                 "Referer": referer,
+                             } if referer else {
+                                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                                               "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                               "Chrome/120.0.0.0 Safari/537.36",
+                             })
     except Exception:
         resp = None
-        final_url, referer = url, ""
     filename, _ = resolve_filename(url, resp)
 
-    # 如果文件名是脚本类型(index.php/download.asp) → GET 探测真实 Content-Disposition
-    if filename and is_script_filename(filename):
-        print(f"\r  [*] 检测到网关链接({filename})，正在获取真实文件名...", end="", flush=True)
+    # 如果文件名看起来像脚本文件（index.php / download.php 等），
+    # 用 GET Range 探测获取真实 Content-Disposition
+    if filename and re.search(r'\.(php|asp|aspx|jsp|cgi|pl)$', filename, re.I):
+        print("\r  [*] 检测到网关注入链接，尝试获取真实文件名...", end="", flush=True)
         try:
             probe_headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1384,18 +1219,17 @@ def main():
                               "Chrome/120.0.0.0 Safari/537.36",
                 "Range": "bytes=0-0",
             }
-            if global_dns_used and global_dns_orig_host:
-                probe_headers["Host"] = global_dns_orig_host
-            probed = requests.get(final_url or url, headers=probe_headers,
-                                  timeout=30, stream=True)
-            new_name, _ = resolve_filename(final_url or url, probed)
-            if new_name and not is_script_filename(new_name):
-                filename = new_name
-            else:
-                filename = None  # GET 探测也失败，交给用户手动输入
-            probed.close()
+            if referer:
+                probe_headers["Referer"] = referer
+            probe_resp = requests.get(final_url, timeout=30, headers=probe_headers,
+                                       stream=True)
+            cd = probe_resp.headers.get("Content-Disposition", "")
+            real_name = parse_content_disposition(cd)
+            if real_name:
+                filename = real_name
+            probe_resp.close()
         except Exception:
-            filename = None  # 网络异常也交给用户手动输入
+            pass
 
     if filename:
         print(f"\r  [>] 文件名: {filename}")
@@ -1414,7 +1248,6 @@ def main():
     user_path = input("  -> ").strip()
     dest = user_path if user_path else default_save
 
-    # 如果用户输入的是已存在的目录，自动拼接文件名
     if os.path.isdir(dest):
         dest = os.path.join(dest, filename)
 

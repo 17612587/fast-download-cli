@@ -2,7 +2,7 @@
 cd /d "%~dp0"
 echo.
 echo ============================================================
-echo   Fast Download CLI v3
+echo   Fast Download CLI
 echo   HTTP/HTTPS/Thunder/Magnet/BT
 echo ============================================================
 echo.
