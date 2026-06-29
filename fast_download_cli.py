@@ -17,7 +17,7 @@ import subprocess
 import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, parse_qs
 
 # ── 启用 Windows ANSI 转义序列 ────────────────────────
 if sys.platform == "win32":
@@ -220,9 +220,18 @@ def parse_content_disposition(cd: str) -> str:
 
 
 def extract_filename_from_url(url: str) -> str:
-    """从 URL 路径中尝试提取文件名"""
-    path = urlparse(url).path
-    name = unquote(path.rstrip("/").split("/")[-1])
+    """从 URL 路径或 query 参数中尝试提取文件名"""
+    parsed = urlparse(url)
+    # 1. 先尝试 query 参数里的 filename / file_name / name 等
+    qs = parse_qs(parsed.query)
+    for key in ("filename", "file_name", "name", "fname", "file"):
+        vals = qs.get(key)
+        if vals:
+            candidate = unquote(vals[0]).strip()
+            if candidate and "." in candidate:
+                return candidate
+    # 2. 再从路径中提取
+    name = unquote(parsed.path.rstrip("/").split("/")[-1])
     if name and "." in name:
         return name
     return None
@@ -1208,10 +1217,15 @@ def main():
         resp = None
     filename, _ = resolve_filename(url, resp)
 
-    # 如果文件名看起来像脚本文件（index.php / download.php 等），
-    # 用 GET Range 探测获取真实 Content-Disposition
-    if filename and re.search(r'\.(php|asp|aspx|jsp|cgi|pl)$', filename, re.I):
-        print("\r  [*] 检测到网关注入链接，尝试获取真实文件名...", end="", flush=True)
+    # 两种情况需要 GET Range 探测真实 Content-Disposition：
+    # 1. 文件名是脚本扩展名（index.php / download.aspx 等网关注入链接）
+    # 2. 根本没获取到文件名
+    need_probe = (not filename) or (filename and re.search(r'\.(php|asp|aspx|jsp|cgi|pl)$', filename, re.I))
+    if need_probe:
+        if not filename:
+            print("\r  [*] 未能从链接自动识别文件名，发起探测请求...", end="", flush=True)
+        else:
+            print("\r  [*] 检测到网关注入链接，尝试获取真实文件名...", end="", flush=True)
         try:
             probe_headers = {
                 "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1223,10 +1237,16 @@ def main():
                 probe_headers["Referer"] = referer
             probe_resp = requests.get(final_url, timeout=30, headers=probe_headers,
                                        stream=True)
+            # 优先从 Content-Disposition 拿文件名
             cd = probe_resp.headers.get("Content-Disposition", "")
             real_name = parse_content_disposition(cd)
             if real_name:
                 filename = real_name
+            # 若 Content-Disposition 也没有，从最终响应 URL 再试一次
+            if not filename or re.search(r'\.(php|asp|aspx|jsp|cgi|pl)$', filename, re.I):
+                fname_from_resp_url = extract_filename_from_url(probe_resp.url)
+                if fname_from_resp_url and not re.search(r'\.(php|asp|aspx|jsp|cgi|pl)$', fname_from_resp_url, re.I):
+                    filename = fname_from_resp_url
             probe_resp.close()
         except Exception:
             pass
@@ -1235,7 +1255,7 @@ def main():
         print(f"\r  [>] 文件名: {filename}")
     else:
         print("\r  [!] 无法从链接自动识别文件名")
-        print("  [>] 请输入文件名:")
+        print("  [>] 请输入文件名 (回车使用 download.bin):")
         filename = input("  -> ").strip()
         if not filename:
             filename = "download.bin"
